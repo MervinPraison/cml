@@ -73,8 +73,12 @@ const launchAndWaitLink = async (opts = {}) => {
 };
 
 exports.tbLink = tbLink;
+
+const DESCRIPTION = 'Connect to tensorboard.dev and get a link';
+const DOCSURL = 'https://cml.dev/doc/ref/tensorboard';
+
 exports.command = 'connect';
-exports.description = 'Connect to tensorboard.dev and get a link';
+exports.description = `${DESCRIPTION}\n${DOCSURL}`;
 
 exports.handler = async (opts) => {
   const { file, credentials, name, description } = opts;
@@ -83,7 +87,7 @@ exports.handler = async (opts) => {
   await fs.mkdir(path, { recursive: true });
   await fs.writeFile(`${path}/uploader-creds.json`, credentials);
 
-  const help = await exec('tensorboard dev upload -h');
+  const help = await exec('tensorboard', 'dev', 'upload', '-h');
   const extraParamsFound =
     (name || description) && help.indexOf('--description') >= 0;
   const extraParams = extraParamsFound
@@ -141,6 +145,8 @@ exports.options = kebabcaseKeys({
   rmWatermark: {
     type: 'boolean',
     description: 'Avoid CML watermark',
+    hidden: true,
     telemetryData: 'name'
   }
 });
+exports.DOCSURL = DOCSURL;

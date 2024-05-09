@@ -6,7 +6,7 @@ const kebabcaseKeys = require('kebabcase-keys');
 const timestring = require('timestring');
 const winston = require('winston');
 
-const { randid, sleep } = require('../../../src/utils');
+const { exec, randid, sleep } = require('../../../src/utils');
 const tf = require('../../../src/terraform');
 
 let cml;
@@ -23,27 +23,26 @@ const shutdown = async (opts) => {
   RUNNER_SHUTTING_DOWN = true;
 
   const { error, cloud } = opts;
-  const {
-    name,
-    workdir = '',
-    tfResource,
-    noRetry,
-    reason,
-    destroyDelay
-  } = opts;
-  const tfPath = workdir;
+  const { name, tfResource, noRetry, reason, destroyDelay, watcher } = opts;
 
   const unregisterRunner = async () => {
-    if (!RUNNER) return;
+    if (!RUNNER) return true;
 
     try {
       winston.info(`Unregistering runner ${name}...`);
       await cml.unregisterRunner({ name });
-      RUNNER && RUNNER.kill('SIGINT');
-      winston.info('\tSuccess');
     } catch (err) {
+      if (err.message.includes('is still running a job')) {
+        winston.warn(`\tCancelling shutdown: ${err.message}`);
+        return false;
+      }
+
       winston.error(`\tFailed: ${err.message}`);
     }
+
+    RUNNER.kill('SIGINT');
+    winston.info('\tSuccess');
+    return true;
   };
 
   const retryWorkflows = async () => {
@@ -63,29 +62,46 @@ const shutdown = async (opts) => {
     }
   };
 
-  const destroyTerraform = async () => {
+  const destroyLeo = async () => {
     if (!tfResource) return;
 
     winston.info(`Waiting ${destroyDelay} seconds to destroy`);
     await sleep(destroyDelay);
 
+    const { cloud, id, region } = JSON.parse(
+      Buffer.from(tfResource, 'base64').toString('utf-8')
+    ).instances[0].attributes;
+
     try {
-      winston.debug(await tf.destroy({ dir: tfPath }));
+      return await exec(
+        'leo',
+        'destroy-runner',
+        '--cloud',
+        cloud,
+        '--region',
+        region,
+        id
+      );
     } catch (err) {
-      winston.error(`\tFailed destroying terraform: ${err.message}`);
+      winston.error(`\tFailed destroying with LEO: ${err.message}`);
     }
   };
 
   if (!cloud) {
     try {
-      await unregisterRunner();
+      if (!(await unregisterRunner())) {
+        RUNNER_SHUTTING_DOWN = false;
+        RUNNER_TIMER = 0;
+        return;
+      }
+      clearInterval(watcher);
       await retryWorkflows();
     } catch (err) {
       winston.error(`Error connecting the SCM: ${err.message}`);
     }
   }
 
-  await destroyTerraform();
+  await destroyLeo();
 
   if (error) throw error;
 
@@ -119,6 +135,8 @@ const runCloud = async (opts) => {
       cloudStartupScript: startupScript,
       cloudAwsSecurityGroup: awsSecurityGroup,
       cloudAwsSubnet: awsSubnet,
+      cloudKubernetesNodeSelector: kubernetesNodeSelector,
+      cloudImage: image,
       workdir
     } = opts;
 
@@ -155,6 +173,8 @@ const runCloud = async (opts) => {
       startupScript,
       awsSecurityGroup,
       awsSubnet,
+      kubernetesNodeSelector,
+      image,
       dockerVolumes
     });
 
@@ -198,7 +218,8 @@ const runCloud = async (opts) => {
           single: attributes.single,
           spot: attributes.spot,
           spotPrice: attributes.spot_price,
-          timeouts: attributes.timeouts
+          timeouts: attributes.timeouts,
+          kubernetesNodeSelector: attributes.kubernetes_node_selector
         };
         winston.info(JSON.stringify(nonSensitiveValues));
       }
@@ -215,6 +236,7 @@ const runLocal = async (opts) => {
     single,
     idleTimeout,
     noRetry,
+    cloudSpot,
     dockerVolumes,
     tfResource,
     tpiVersion
@@ -258,22 +280,31 @@ const runLocal = async (opts) => {
     });
   }
 
-  const dataHandler = async (data) => {
-    const logs = await cml.parseRunnerLog({ data, name });
-    for (const log of logs) {
-      winston.info('runner status', log);
+  const dataHandler =
+    ({ cloudSpot }) =>
+    async (data) => {
+      winston.debug(data.toString());
+      const logs = await cml.parseRunnerLog({ data, name, cloudSpot });
+      for (const log of logs) {
+        winston.info('runner status', log);
 
-      if (log.status === 'job_started') {
-        const { job: id, pipeline, date } = log;
-        RUNNER_JOBS_RUNNING.push({ id, pipeline, date });
-      }
+        if (log.status === 'job_started') {
+          const { job: id, pipeline, date } = log;
+          RUNNER_JOBS_RUNNING.push({ id, pipeline, date });
+        }
 
-      if (log.status === 'job_ended') {
-        RUNNER_JOBS_RUNNING.pop();
-        if (single) await shutdown({ ...opts, reason: 'single job' });
+        if (log.status === 'job_ended') {
+          // Runners can only take a job at a time, so the whole concept of using
+          // an array as a stack/counter (formerly RUNNER_JOBS_RUNNING.pop() on
+          // the line below) is a footgun. It should be just a boolean variable
+          // to hold the busy/idle status. To avoid too much refactoring, we just
+          // empty the array, so empty means idle and populated means busy.
+          RUNNER_JOBS_RUNNING.length = 0;
+
+          if (single) await shutdown({ ...opts, reason: 'single job' });
+        }
       }
-    }
-  };
+    };
 
   const proc = await cml.startRunner({
     workdir,
@@ -284,8 +315,8 @@ const runLocal = async (opts) => {
     dockerVolumes
   });
 
-  proc.stderr.on('data', dataHandler);
-  proc.stdout.on('data', dataHandler);
+  proc.stderr.on('data', dataHandler({ cloudSpot }));
+  proc.stdout.on('data', dataHandler({ cloudSpot }));
   proc.on('disconnect', () =>
     shutdown({ ...opts, error: new Error('runner proccess lost') })
   );
@@ -301,8 +332,7 @@ const runLocal = async (opts) => {
       const idle = RUNNER_JOBS_RUNNING.length === 0;
 
       if (RUNNER_TIMER >= idleTimeout) {
-        shutdown({ ...opts, reason: `timeout:${idleTimeout}` });
-        clearInterval(watcher);
+        shutdown({ ...opts, reason: `timeout:${idleTimeout}`, watcher });
       }
 
       RUNNER_TIMER = idle ? RUNNER_TIMER + 1 : 0;
@@ -406,8 +436,11 @@ const run = async (opts) => {
   else await runLocal(opts);
 };
 
+const DESCRIPTION = 'Launch and register a self-hosted runner';
+const DOCSURL = 'https://cml.dev/doc/ref/runner';
+
 exports.command = 'launch';
-exports.description = 'Launch and register a self-hosted runner';
+exports.description = `${DESCRIPTION}\n${DOCSURL}`;
 
 exports.handler = async (opts) => {
   ({ cml } = opts);
@@ -440,7 +473,7 @@ exports.options = kebabcaseKeys({
   },
   name: {
     type: 'string',
-    default: `cml-${randid()}`,
+    default: `${randid()}`,
     defaultDescription: 'cml-{ID}',
     description: 'Name displayed in the repository once registered'
   },
@@ -494,7 +527,8 @@ exports.options = kebabcaseKeys({
   cloudType: {
     type: 'string',
     description:
-      'Instance type. Choices: [m, l, xl]. Also supports native types like i.e. t2.micro'
+      'Instance type. Choices: [m, l, xl]. Also supports native types like i.e. t2.micro',
+    telemetryData: 'full'
   },
   cloudPermissionSet: {
     type: 'string',
@@ -517,7 +551,8 @@ exports.options = kebabcaseKeys({
     type: 'string',
     description:
       'GPU type. Choices: k80, v100, or native types e.g. nvidia-tesla-t4',
-    coerce: (val) => (val === 'nogpu' ? undefined : val)
+    coerce: (val) => (val === 'nogpu' ? undefined : val),
+    telemetryData: 'full'
   },
   cloudHddSize: {
     type: 'number',
@@ -556,6 +591,22 @@ exports.options = kebabcaseKeys({
     description: 'Specifies the subnet to use within AWS',
     alias: 'cloud-aws-subnet-id'
   },
+  cloudKubernetesNodeSelector: {
+    type: 'array',
+    string: true,
+    default: [],
+    coerce: (items) => {
+      const keyValuePairs = items.map((item) => [...item.split(/=(.+)/), null]);
+      return Object.fromEntries(keyValuePairs);
+    },
+    description:
+      'Key Value pairs to specify the node selector to use within Kubernetes i.e. tags/labels "key=value". If not provided a default "accelerator=infer" key pair will be used'
+  },
+  cloudImage: {
+    type: 'string',
+    description: 'Custom machine/container image',
+    hidden: true
+  },
   tpiVersion: {
     type: 'string',
     default: '>= 0.9.10',
@@ -573,6 +624,12 @@ exports.options = kebabcaseKeys({
     hidden: true,
     alias: 'tf_resource'
   },
+  gcpAccessToken: {
+    hidden: true
+  },
+  runnerPath: {
+    hidden: true
+  },
   destroyDelay: {
     type: 'number',
     default: 10,
@@ -581,3 +638,4 @@ exports.options = kebabcaseKeys({
       'Seconds to wait for collecting logs on failure (https://github.com/iterative/cml/issues/413)'
   }
 });
+exports.DOCSURL = DOCSURL;

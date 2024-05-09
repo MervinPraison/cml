@@ -2,6 +2,7 @@ const fs = require('fs');
 const PATH = require('path');
 const { Buffer } = require('buffer');
 const fetch = require('node-fetch');
+const ProxyAgent = require('proxy-agent');
 const NodeSSH = require('node-ssh').NodeSSH;
 const stripAnsi = require('strip-ansi');
 const winston = require('winston');
@@ -22,17 +23,19 @@ const getos = async () => {
 
 const waitForever = () => new Promise((resolve) => resolve);
 
-const exec = async (command) => {
+const exec = async (file, ...args) => {
   return new Promise((resolve, reject) => {
-    require('child_process').exec(
-      command,
+    require('child_process').execFile(
+      file,
+      args,
       { ...process.env },
       (error, stdout, stderr) => {
         if (!process.stdout.isTTY) {
           stdout = stripAnsi(stdout);
           stderr = stripAnsi(stderr);
         }
-        if (error) reject(new Error(`${command}\n\t${stdout}\n\t${stderr}`));
+        if (error)
+          reject(new Error(`${[file, ...args]}\n\t${stdout}\n\t${stderr}`));
 
         resolve((stdout || stderr).slice(0, -1));
       }
@@ -68,7 +71,6 @@ const fetchUploadData = async (opts) => {
   const size = path ? (await fs.promises.stat(path)).size : buffer.length;
   const data = path ? fs.createReadStream(path) : buffer;
   const mime = mimeTypeIn || (await mimeType(opts));
-
   return { mime, size, data };
 };
 
@@ -85,7 +87,6 @@ const upload = async (opts) => {
   };
 
   if (session) headers['Content-Address-Seed'] = `${session}:${path}`;
-
   const response = await fetch(url, { method: 'POST', headers, body });
   const uri = await response.text();
 
@@ -136,14 +137,14 @@ const isProcRunning = async (opts) => {
 };
 
 const watermarkUri = ({ uri, type } = {}) => {
-  return uriParmam({ uri, param: 'cml', value: type });
+  return uriParam({ uri, param: 'cml', value: type });
 };
 
 const preventcacheUri = ({ uri } = {}) => {
-  return uriParmam({ uri, param: 'cache-bypass', value: uuid.v4() });
+  return uriParam({ uri, param: 'cache-bypass', value: uuid.v4() });
 };
 
-const uriParmam = (opts = {}) => {
+const uriParam = (opts = {}) => {
   const { uri, param, value } = opts;
   const url = new URL(uri);
   url.searchParams.set(param, value);
@@ -152,7 +153,7 @@ const uriParmam = (opts = {}) => {
 
 const download = async (opts = {}) => {
   const { url, path } = opts;
-  const res = await fetch(url);
+  const res = await fetch(url, { agent: new ProxyAgent() });
   const stream = fs.createWriteStream(path);
   return new Promise((resolve, reject) => {
     stream.on('error', (err) => reject(err));

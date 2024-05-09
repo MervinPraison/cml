@@ -4,7 +4,7 @@ const { exec, isProcRunning, sleep } = require('../../../src/utils');
 const { tbLink } = require('./connect');
 
 const CREDENTIALS =
-  '{"refresh_token": "1//03FiVnGk2xhnNCgYIARAAGAMSNwF-L9IrPH8FOOVWEYUihFDToqxyLArxfnbKFmxEfhzys_KYVVzBisYlAy225w4HaX3ais5TV_Q", "token_uri": "https://oauth2.googleapis.com/token", "client_id": "373649185512-8v619h5kft38l4456nm2dj4ubeqsrvh6.apps.googleusercontent.com", "client_secret": "pOyAuU2yq2arsM98Bw5hwYtr", "scopes": ["openid", "https://www.googleapis.com/auth/userinfo.email"], "type": "authorized_user"}';
+  '{"refresh_token": "1//03vy0UEEbtGrlCgYIARAAGAMSNwF-L9Irj4R63gOnR8ySz0CqG65smNVt7WWqV-fDGHqtzJr_3Vp71fbPnYgkpeGoDnIAVeP28c8", "token_uri": "https://oauth2.googleapis.com/token", "client_id": "373649185512-26ojik4u7dt0rdtfdmfnhpajqqh579qd.apps.googleusercontent.com", "client_secret": "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", "scopes": ["openid", "https://www.googleapis.com/auth/userinfo.email"], "type": "authorized_user"}';
 
 const isTbRunning = async () => {
   await sleep(2);
@@ -15,7 +15,7 @@ const isTbRunning = async () => {
 
 const rmTbDevExperiment = async (tbOutput) => {
   const id = /experiment\/([a-zA-Z0-9]{22})/.exec(tbOutput)[1];
-  await exec(`tensorboard dev delete --experiment_id ${id}`);
+  await exec('tensorboard', 'dev', 'delete', '--experiment_id', id);
 };
 
 describe('tbLink', () => {
@@ -56,9 +56,20 @@ describe('CML e2e', () => {
     const desc = 'Test experiment';
     const title = 'go to the experiment';
     const output = await exec(
-      `node ./bin/cml.js tensorboard-dev --credentials '${CREDENTIALS}' \
-        --md --title '${title}' \
-        --logdir logs --name '${name}' --description '${desc}'`
+      'node',
+      './bin/cml.js',
+      'tensorboard-dev',
+      '--credentials',
+      CREDENTIALS,
+      '--md',
+      '--title',
+      title,
+      '--logdir',
+      'logs',
+      '--name',
+      name,
+      '--description',
+      desc
     );
 
     const isRunning = await isTbRunning();
@@ -71,7 +82,13 @@ describe('CML e2e', () => {
 
   test('cml tensorboard-dev invalid creds', async () => {
     try {
-      await exec(`node ./bin/cml.js tensorboard-dev --credentials 'invalid'`);
+      await exec(
+        'node',
+        './bin/cml.js',
+        'tensorboard-dev',
+        '--credentials',
+        'invalid'
+      );
     } catch (err) {
       expect(err.message.includes('json.decoder.JSONDecodeError')).toBe(true);
     }

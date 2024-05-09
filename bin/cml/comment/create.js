@@ -1,7 +1,10 @@
 const kebabcaseKeys = require('kebabcase-keys');
 
+const DESCRIPTION = 'Create a comment';
+const DOCSURL = 'https://cml.dev/doc/ref/comment#create';
+
 exports.command = 'create <markdown file>';
-exports.description = 'Create a comment';
+exports.description = `${DESCRIPTION}\n${DOCSURL}`;
 
 exports.handler = async (opts) => {
   const { cml } = opts;
@@ -15,16 +18,25 @@ exports.builder = (yargs) =>
     .options(exports.options);
 
 exports.options = kebabcaseKeys({
+  target: {
+    type: 'string',
+    description:
+      'Comment type (`commit`, `pr`, `commit/f00bar`, `pr/42`, `issue/1337`),' +
+      'default is automatic (`pr` but fallback to `commit`).'
+  },
   pr: {
     type: 'boolean',
     description:
-      'Post to an existing PR/MR associated with the specified commit'
+      'Post to an existing PR/MR associated with the specified commit',
+    conflicts: ['target', 'commitSha'],
+    hidden: true
   },
   commitSha: {
     type: 'string',
     alias: 'head-sha',
-    default: 'HEAD',
-    description: 'Commit SHA linked to this comment'
+    description: 'Commit SHA linked to this comment',
+    conflicts: ['target', 'pr'],
+    hidden: true
   },
   watch: {
     type: 'boolean',
@@ -63,6 +75,15 @@ exports.options = kebabcaseKeys({
     type: 'boolean',
     description:
       'Avoid watermark; CML needs a watermark to be able to distinguish CML comments from others',
+    hidden: true,
     telemetryData: 'name'
+  },
+  watermarkTitle: {
+    type: 'string',
+    description:
+      'Hidden comment marker (used for targeting in subsequent `cml comment update`); "{workflow}" & "{run}" are auto-replaced',
+    default: '',
+    conflicts: ['rmWatermark']
   }
 });
+exports.DOCSURL = DOCSURL;

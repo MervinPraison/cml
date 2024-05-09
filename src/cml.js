@@ -10,6 +10,7 @@ const winston = require('winston');
 const remark = require('remark');
 const visit = require('unist-util-visit');
 
+const { parseCommentTarget } = require('./commenttarget');
 const Gitlab = require('./drivers/gitlab');
 const Github = require('./drivers/github');
 const BitbucketCloud = require('./drivers/bitbucket_cloud');
@@ -20,7 +21,7 @@ const {
   preventcacheUri,
   waitForever
 } = require('./utils');
-
+const { Watermark } = require('./watermark');
 const { GITHUB_REPOSITORY, CI_PROJECT_URL, BITBUCKET_REPO_UUID } = process.env;
 
 const GIT_USER_NAME = 'Olivaw[bot]';
@@ -101,6 +102,10 @@ const fixGitSafeDirectory = () => {
       .split(/[\r\n]+/)
       .includes(directory) || gitConfigSafeDirectory(directory);
 
+  // Fail meaningfully if git is not available,
+  // see https://github.com/nodejs/node/issues/33458
+  spawnSync('git');
+
   // Fix for git>=2.36.0
   addSafeDirectory('*');
 
@@ -131,7 +136,7 @@ class CML {
 
   async revParse({ ref = 'HEAD' } = {}) {
     try {
-      return await exec(`git rev-parse ${ref}`);
+      return await exec('git', 'rev-parse', ref);
     } catch (err) {
       winston.warn(
         'Failed to obtain SHA. Perhaps not in the correct git folder'
@@ -146,7 +151,7 @@ class CML {
 
   async branch() {
     const { branch } = this.getDriver();
-    return branch || (await exec(`git branch --show-current`));
+    return branch || (await exec('git', 'branch', '--show-current'));
   }
 
   getDriver() {
@@ -161,29 +166,35 @@ class CML {
   }
 
   async commentCreate(opts = {}) {
-    const triggerSha = await this.triggerSha();
     const {
-      commitSha: inCommitSha = triggerSha,
-      rmWatermark,
-      update,
+      commitSha,
+      markdownFile,
       pr,
       publish,
       publishUrl,
-      markdownFile,
       report: testReport,
+      rmWatermark,
+      target: commentTarget = 'auto',
+      triggerFile,
+      update,
       watch,
-      triggerFile
+      watermarkTitle
     } = opts;
 
-    const commitSha =
-      (await this.revParse({ ref: inCommitSha })) || inCommitSha;
+    const drv = this.getDriver();
 
     if (rmWatermark && update)
-      throw new Error('watermarks are mandatory for updateable comments');
+      throw new Error('watermarks are mandatory for updatable comments');
 
+    // Create the watermark.
     const watermark = rmWatermark
-      ? ''
-      : '![CML watermark](https://raw.githubusercontent.com/iterative/cml/master/assets/watermark.svg)';
+      ? null
+      : new Watermark({
+          label: watermarkTitle,
+          workflow: drv.workflowId,
+          run: drv.runId,
+          sha: commitSha || (await this.triggerSha())
+        });
 
     let userReport = testReport;
     try {
@@ -194,29 +205,57 @@ class CML {
       if (!watch) throw err;
     }
 
-    let report = `${userReport}\n\n${watermark}`;
-    const drv = this.getDriver();
+    let report = userReport;
+    if (watermark) {
+      report = watermark.appendTo(userReport);
+    }
 
     const publishLocalFiles = async (tree) => {
       const nodes = [];
 
-      visit(tree, ['definition', 'image', 'link'], (node) => nodes.push(node));
+      visit(tree, ['definition', 'image', 'link'], (node) => {
+        nodes.push(node);
+      });
 
+      const isWatermark = (node) => {
+        return node.title && node.title.startsWith('CML watermark');
+      };
       const visitor = async (node) => {
-        if (node.url && node.alt !== 'CML watermark') {
-          const absolutePath = path.resolve(
-            path.dirname(markdownFile),
-            node.url
-          );
-          if (!triggerFile && watch) watcher.add(absolutePath);
-          try {
+        if (node.url && !isWatermark(node)) {
+          // Check for embedded images from dvclive
+          if (node.url.startsWith('data:image/')) {
+            winston.debug(
+              `found already embedded image, head: ${node.url.slice(0, 25)}`
+            );
+            const encodedData = node.url.slice(node.url.indexOf(',') + 1);
+            const mimeType = node.url.slice(
+              node.url.indexOf(':') + 1,
+              node.url.indexOf(';')
+            );
+            const data = Buffer.from(encodedData, 'base64');
             node.url = await this.publish({
               ...opts,
-              path: absolutePath,
+              mimeType: mimeType,
+              buffer: data,
               url: publishUrl
             });
-          } catch (err) {
-            if (err.code !== 'ENOENT') throw err;
+          } else {
+            const absolutePath = path.resolve(
+              path.dirname(markdownFile),
+              node.url
+            );
+            if (!triggerFile && watch) watcher.add(absolutePath);
+            try {
+              node.url = await this.publish({
+                ...opts,
+                path: absolutePath,
+                url: publishUrl
+              });
+            } catch (err) {
+              if (err.code === 'ENOENT')
+                winston.debug(`file not found: ${node.url} (${absolutePath})`);
+              else throw err;
+            }
           }
         }
       };
@@ -264,62 +303,30 @@ class CML {
     let comment;
     const updatableComment = (comments) => {
       return comments.reverse().find(({ body }) => {
-        return body.includes('watermark.svg');
+        return !watermark || watermark.isIn(body);
       });
     };
 
-    const isBB = this.driver === BB;
-    if (pr || isBB) {
-      let commentUrl;
-
-      if (commitSha !== triggerSha)
-        winston.info(
-          `Looking for PR associated with --commit-sha="${inCommitSha}".\nSee https://cml.dev/doc/ref/send-comment.`
-        );
-
-      const longReport = `${commitSha.substr(0, 7)}\n\n${report}`;
-      const [commitPr = {}] = await drv.commitPrs({ commitSha });
-      const { url } = commitPr;
-
-      if (!url && !isBB)
-        throw new Error(`PR for commit sha "${inCommitSha}" not found`);
-
-      if (url) {
-        const [prNumber] = url.split('/').slice(-1);
-
-        if (update)
-          comment = updatableComment(await drv.prComments({ prNumber }));
-
-        if (update && comment) {
-          commentUrl = await drv.prCommentUpdate({
-            report: longReport,
-            id: comment.id,
-            prNumber
-          });
-        } else
-          commentUrl = await drv.prCommentCreate({
-            report: longReport,
-            prNumber
-          });
-
-        if (this.driver !== 'bitbucket') return commentUrl;
-      }
-    }
+    const target = await parseCommentTarget({
+      commitSha,
+      pr,
+      target: commentTarget,
+      drv
+    });
 
     if (update) {
-      comment = updatableComment(await drv.commitComments({ commitSha }));
+      comment = updatableComment(await drv[target.target + 'Comments'](target));
 
       if (comment)
-        return await drv.commentUpdate({
+        return await drv[target.target + 'CommentUpdate']({
           report,
           id: comment.id,
-          commitSha
+          ...target
         });
     }
-
-    return await drv.commentCreate({
+    return await drv[target.target + 'CommentCreate']({
       report,
-      commitSha
+      ...target
     });
   }
 
@@ -359,7 +366,7 @@ class CML {
   }
 
   async parseRunnerLog(opts = {}) {
-    let { data, name } = opts;
+    let { data, name, cloudSpot } = opts;
     if (!data) return [];
 
     data = data.toString('utf8');
@@ -389,7 +396,15 @@ class CML {
           log.job = parseId('job');
           log.pipeline = parseId('pipeline');
 
-          if (name && this.driver === GITHUB) {
+          // GitHub API doesn’t seem to provide a straightforward way to get the
+          // job identifier from the runner logs, so we need to query several API
+          // endpoints to retrieve it. Due to several broken parts of our logic and
+          // some unexpected API responses, performing these queries may trigger API
+          // rate limits, causing the whole `cml` process to crash. Given that
+          // retrieving the job identifier is only useful for spot instance recovery
+          // (i.e. automated retryWorkflow), we can save ourselves all the hassle if
+          // —-cloud-spot is not set or —-driver is not GitHub.
+          if (cloudSpot && this.driver === GITHUB) {
             const { id: runnerId } = await this.runnerByName({ name });
             const { id } = await driver.runnerJob({ runnerId });
             log.job = id;
@@ -408,7 +423,14 @@ class CML {
   }
 
   async startRunner(opts = {}) {
-    return await this.getDriver().startRunner(opts);
+    const env = {};
+    const sensitive = [
+      '_CML_RUNNER_SENSITIVE_ENV',
+      ...process.env._CML_RUNNER_SENSITIVE_ENV.split(':')
+    ];
+    for (const variable in process.env)
+      if (!sensitive.includes(variable)) env[variable] = process.env[variable];
+    return await this.getDriver().startRunner({ ...opts, env });
   }
 
   async registerRunner(opts = {}) {
@@ -469,25 +491,54 @@ class CML {
       userName = GIT_USER_NAME,
       remote = GIT_REMOTE
     } = opts;
+    const { fetchDepth = unshallow ? 0 : undefined } = opts;
 
     const driver = this.getDriver();
-    await exec(await driver.updateGitConfig({ userName, userEmail, remote }));
-    if (unshallow) {
-      if ((await exec('git rev-parse --is-shallow-repository')) === 'true') {
-        await exec('git fetch --unshallow');
+    const commands = await driver.updateGitConfig({
+      userName,
+      userEmail,
+      remote
+    });
+    for (const command of commands) {
+      try {
+        await exec(...command);
+      } catch (err) {
+        if (
+          JSON.stringify(command.slice(0, 3)) !==
+          JSON.stringify(['git', 'config', '--unset'])
+        )
+          throw err;
       }
     }
-    await exec('git fetch --all');
+    if (fetchDepth !== undefined) {
+      if (fetchDepth <= 0) {
+        if (
+          (await exec('git', 'rev-parse', '--is-shallow-repository')) === 'true'
+        ) {
+          return await exec('git', 'fetch', '--all', '--tags', '--unshallow');
+        }
+      } else {
+        return await exec(
+          'git',
+          'fetch',
+          '--all',
+          '--tags',
+          '--depth',
+          fetchDepth
+        );
+      }
+    }
   }
 
   async prCreate(opts = {}) {
     const driver = this.getDriver();
     const {
       remote = GIT_REMOTE,
-      globs = ['dvc.lock', '.gitignore'],
+      globs = [],
       md,
       skipCi,
       branch,
+      targetBranch,
       message,
       title,
       body,
@@ -507,15 +558,23 @@ class CML {
     };
 
     const { files } = await git.status();
-    if (!files.length) {
-      winston.warn('No files changed. Nothing to do.');
+
+    if (!files.length && globs.length) {
+      winston.warn('No changed files matched by glob path. Nothing to do.');
       return;
     }
 
-    const paths = (await globby(globs)).filter((path) =>
-      files.map((file) => file.path).includes(path)
+    const prefix = await new Promise((resolve, reject) =>
+      git.revparse(['--show-prefix'], (err, data) =>
+        err !== null ? reject(err) : resolve(data)
+      )
     );
-    if (!paths.length) {
+
+    const paths = (await globby(globs)).filter((path) =>
+      files.map((file) => file.path).includes(prefix + path)
+    );
+
+    if (!paths.length && globs.length) {
       winston.warn('Input files are not affected. Nothing to do.');
       return;
     }
@@ -523,16 +582,38 @@ class CML {
     const sha = await this.triggerSha();
     const shaShort = sha.substr(0, 8);
 
-    const target = await this.branch();
+    let target = await this.branch();
+
+    if (targetBranch) {
+      try {
+        await exec(
+          'git',
+          'ls-remote',
+          '--exit-code',
+          await exec('git', 'config', '--get', `remote.${remote}.url`),
+          targetBranch
+        );
+
+        target = targetBranch;
+      } catch (error) {
+        winston.error('The target branch does not exist.');
+        process.exit(1);
+      }
+    }
+
     const source = branch || `${target}-cml-pr-${shaShort}`;
 
     const branchExists = (
       await exec(
-        `git ls-remote $(git config --get remote.${remote}.url) ${source}`
+        'git',
+        'ls-remote',
+        await exec('git', 'config', '--get', `remote.${remote}.url`),
+        source
       )
     ).includes(source);
 
     if (branchExists) {
+      driver.warn(`Branch ${source} already exists`);
       const prs = await driver.prs();
       const { url } =
         prs.find(
@@ -541,16 +622,20 @@ class CML {
 
       if (url) return renderPr(url);
     } else {
-      await exec(`git fetch ${remote} ${sha}`);
-      await exec(`git checkout -B ${target} ${sha}`);
-      await exec(`git checkout -b ${source}`);
-      await exec(`git add ${paths.join(' ')}`);
-      let commitMessage = message || `CML PR for ${shaShort}`;
-      if (skipCi || (!message && !(merge || rebase || squash))) {
-        commitMessage += ' [skip ci]';
+      await exec('git', 'fetch', remote, sha);
+      if (paths.length) await exec('git', 'checkout', '-B', target, sha);
+      await exec('git', 'checkout', '-b', source);
+
+      if (paths.length) {
+        await exec('git', 'add', ...paths);
+        let commitMessage = message || `CML PR for ${shaShort}`;
+        if (skipCi || (!message && !(merge || rebase || squash))) {
+          commitMessage += ' [skip ci]';
+        }
+        await exec('git', 'commit', '-m', commitMessage);
       }
-      await exec(`git commit -m "${commitMessage}"`);
-      await exec(`git push --set-upstream ${remote} ${source}`);
+
+      await exec('git', 'push', '--set-upstream', remote, source);
     }
 
     const url = await driver.prCreate({

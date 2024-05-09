@@ -37,7 +37,8 @@ const {
 const ID_DO_NOT_TRACK = 'do-not-track';
 
 const deterministic = async (data) => {
-  if (!data) throw new Error('data is not set calculating deterministic uuid');
+  if (!data)
+    throw new Error("data is not set, can't calculate a deterministic uuid");
 
   const namespace = uuidv5('iterative.ai', uuidv5.DNS);
   const name = await promisify(scrypt)(data, parse(namespace), 8, {
@@ -95,7 +96,7 @@ const userId = async ({ cml } = {}) => {
       } else if (ci === 'bitbucket') {
         rawId = BITBUCKET_STEP_TRIGGERER_UUID;
       } else {
-        rawId = await exec(`git log -1 --pretty=format:'%ae'`);
+        rawId = await exec('git', 'log', '-1', "--pretty=format:'%ae'");
       }
 
       return await deterministic(rawId);
@@ -145,7 +146,7 @@ const OS = () => {
 
 const jitsuEventPayload = async ({
   action = '',
-  error = '',
+  error,
   extra = {},
   cml
 } = {}) => {
